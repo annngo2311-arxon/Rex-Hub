@@ -1,0 +1,1117 @@
+--[[
+    Rex Script - Utility Menu (horizontal/grid layout)
+    Core: Fix Lag, Speed (slider), Super Jump (slider), Crosshair (cosmetic),
+          Auto Jump, Anti-AFK, Wide FOV, Extended Zoom, Low Render Distance,
+          Fullbright, Kill Menu, Minimize
+    Rex exclusives: Stats (FPS/Ping), Mute, Quick Respawn, Reset All,
+          Export Config (clipboard), Session Timer
+    Type: LocalScript (place in StarterPlayerScripts or run via executor)
+]]
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local VirtualUser = game:GetService("VirtualUser")
+
+local LocalPlayer = Players.LocalPlayer
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+local Camera = workspace.CurrentCamera
+
+local activeConnections = {}
+local scriptStartTime = os.clock()
+
+-- ===================== THEME =====================
+local NEON_BLUE = Color3.fromRGB(0, 170, 255)
+local NEON_ORANGE = Color3.fromRGB(255, 140, 0)
+
+-- ===================== SAFE GUI PARENT (Delta/executor hardening) =====================
+local function getSafeGuiParent()
+    local playerGui = nil
+    pcall(function()
+        playerGui = LocalPlayer:WaitForChild("PlayerGui", 5)
+    end)
+    if playerGui then
+        return playerGui
+    end
+
+    local success, parent = pcall(function()
+        if type(gethui) == "function" then
+            return gethui()
+        end
+        return game:GetService("CoreGui")
+    end)
+    if success and parent then
+        return parent
+    end
+
+    return nil
+end
+
+local targetParent = getSafeGuiParent()
+if not targetParent then
+    warn("[Rex] Could not find a safe GUI parent — aborting.")
+    return
+end
+
+for _, container in ipairs({LocalPlayer:FindFirstChildOfClass("PlayerGui"), targetParent}) do
+    if container then
+        pcall(function()
+            for _, child in ipairs(container:GetChildren()) do
+                if child.Name == "RexScript" or child.Name == "AXN" then child:Destroy() end
+            end
+        end)
+    end
+end
+
+-- ===================== STATE =====================
+local MIN_SPEED = 0
+local MAX_SPEED = 1000
+local currentSpeed = 16
+local speedEnabled = false
+
+local DEFAULT_JUMP_POWER = 50
+local MIN_JUMP = 0
+local MAX_JUMP = 500
+local currentJump = DEFAULT_JUMP_POWER
+local jumpEnabled = false
+
+local EFFECT_CLASSES = {
+    ParticleEmitter = true,
+    Trail = true,
+    Smoke = true,
+    Fire = true,
+    Sparkles = true,
+    Beam = true,
+    Explosion = true,
+    Highlight = true,
+}
+local autoCleanConn = nil
+local fixLagOn = false
+
+local crosshairEnabled = false
+
+local autoJumpEnabled = Humanoid.AutoJumpEnabled
+local antiAfkEnabled = false
+local wideFovEnabled = false
+local DEFAULT_FOV = Camera and Camera.FieldOfView or 70
+local WIDE_FOV = 100
+
+local zoomEnabled = false
+local DEFAULT_MAX_ZOOM = LocalPlayer.CameraMaxZoomDistance
+local EXTENDED_ZOOM = 500
+
+local lowRenderEnabled = false
+local DEFAULT_STREAM_RADIUS = nil
+pcall(function() DEFAULT_STREAM_RADIUS = workspace.StreamingTargetRadius end)
+
+local fullbrightEnabled = false
+local savedLighting = {}
+
+-- Rex-exclusive state
+local statsEnabled = false
+local muteEnabled = false
+local mutedSounds = {}
+local muteWatchConn = nil
+local sessionTimerEnabled = false
+
+local charAddedConn = LocalPlayer.CharacterAdded:Connect(function(newChar)
+    Character = newChar
+    Humanoid = Character:WaitForChild("Humanoid")
+    Humanoid.AutoJumpEnabled = autoJumpEnabled
+end)
+table.insert(activeConnections, charAddedConn)
+
+-- ===================== ENFORCEMENT LOOPS =====================
+RunService:BindToRenderStep("REX_SpeedJumpEnforce", Enum.RenderPriority.Last.Value + 1, function()
+    if not (Humanoid and Humanoid.Parent) then return end
+
+    -- ---- Speed ----
+    local targetSpeed = speedEnabled and currentSpeed or 16
+    if Humanoid.WalkSpeed ~= targetSpeed then
+        Humanoid.WalkSpeed = targetSpeed
+    end
+    if speedEnabled then
+        local rootPart = Character and Character:FindFirstChild("HumanoidRootPart")
+        if rootPart and Humanoid.MoveDirection.Magnitude > 0 then
+            local horizontal = Humanoid.MoveDirection * currentSpeed
+            local vel = rootPart.AssemblyLinearVelocity
+            rootPart.AssemblyLinearVelocity = Vector3.new(horizontal.X, vel.Y, horizontal.Z)
+        end
+    end
+
+    -- ---- Jump (property layer; JumpRequest hook below is the main layer) ----
+    local targetJump = jumpEnabled and currentJump or DEFAULT_JUMP_POWER
+    local targetHeight = (targetJump / DEFAULT_JUMP_POWER) * 7.2
+    if Humanoid.JumpPower ~= targetJump then
+        Humanoid.JumpPower = targetJump
+    end
+    if math.abs(Humanoid.JumpHeight - targetHeight) > 0.01 then
+        Humanoid.JumpHeight = targetHeight
+    end
+end)
+
+-- Direct-velocity jump boost on the exact moment of takeoff.
+local jumpRequestConn = UserInputService.JumpRequest:Connect(function()
+    if not jumpEnabled then return end
+    local rootPart = Character and Character:FindFirstChild("HumanoidRootPart")
+    if rootPart then
+        local vel = rootPart.AssemblyLinearVelocity
+        rootPart.AssemblyLinearVelocity = Vector3.new(vel.X, currentJump, vel.Z)
+    end
+end)
+table.insert(activeConnections, jumpRequestConn)
+
+-- Anti-AFK
+local idledConn = LocalPlayer.Idled:Connect(function()
+    if not antiAfkEnabled then return end
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end)
+table.insert(activeConnections, idledConn)
+
+-- ===================== GUI SETUP =====================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "RexScript"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.DisplayOrder = 999999
+ScreenGui.Enabled = true
+ScreenGui.Parent = targetParent
+
+local MenuScale = Instance.new("UIScale")
+MenuScale.Name = "MobileScale"
+MenuScale.Scale = 1
+MenuScale.Parent = ScreenGui
+local function updateMenuScale()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local viewport = cam.ViewportSize
+    local scaleX = viewport.X / 460
+    local scaleY = viewport.Y / 460
+    MenuScale.Scale = math.clamp(math.min(scaleX, scaleY, 1), 0.5, 1)
+end
+updateMenuScale()
+if workspace.CurrentCamera then
+    local scaleConn = workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateMenuScale)
+    table.insert(activeConnections, scaleConn)
+end
+
+-- Cosmetic crosshair overlay (static, no tracking/targeting logic)
+local CrosshairCircle = Instance.new("Frame")
+CrosshairCircle.Name = "CrosshairCircle"
+CrosshairCircle.Size = UDim2.new(0, 42, 0, 42)
+CrosshairCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+CrosshairCircle.Position = UDim2.new(0.5, 0, 0.5, 0)
+CrosshairCircle.BackgroundTransparency = 1
+CrosshairCircle.Visible = false
+CrosshairCircle.ZIndex = 1
+CrosshairCircle.Parent = ScreenGui
+local chCorner = Instance.new("UICorner")
+chCorner.CornerRadius = UDim.new(1, 0)
+chCorner.Parent = CrosshairCircle
+local chStroke = Instance.new("UIStroke")
+chStroke.Color = NEON_BLUE
+chStroke.Thickness = 2
+chStroke.Transparency = 0.15
+chStroke.Parent = CrosshairCircle
+local chDot = Instance.new("Frame")
+chDot.Size = UDim2.new(0, 4, 0, 4)
+chDot.AnchorPoint = Vector2.new(0.5, 0.5)
+chDot.Position = UDim2.new(0.5, 0, 0.5, 0)
+chDot.BackgroundColor3 = NEON_BLUE
+chDot.BorderSizePixel = 0
+chDot.Parent = CrosshairCircle
+local chDotCorner = Instance.new("UICorner")
+chDotCorner.CornerRadius = UDim.new(1, 0)
+chDotCorner.Parent = chDot
+
+-- Rex-exclusive: FPS/Ping stats overlay (independent of the main menu)
+local StatsOverlay = Instance.new("Frame")
+StatsOverlay.Name = "StatsOverlay"
+StatsOverlay.Size = UDim2.new(0, 140, 0, 28)
+StatsOverlay.Position = UDim2.new(0, 10, 0, 10)
+StatsOverlay.BackgroundColor3 = Color3.fromRGB(10, 12, 18)
+StatsOverlay.BackgroundTransparency = 0.15
+StatsOverlay.Visible = false
+StatsOverlay.Parent = ScreenGui
+local statsCorner = Instance.new("UICorner")
+statsCorner.CornerRadius = UDim.new(0, 6)
+statsCorner.Parent = StatsOverlay
+local statsStroke = Instance.new("UIStroke")
+statsStroke.Color = NEON_BLUE
+statsStroke.Thickness = 1
+statsStroke.Transparency = 0.3
+statsStroke.Parent = StatsOverlay
+local StatsLabel = Instance.new("TextLabel")
+StatsLabel.Size = UDim2.new(1, 0, 1, 0)
+StatsLabel.BackgroundTransparency = 1
+StatsLabel.Text = "FPS: -- | Ping: --ms"
+StatsLabel.TextColor3 = NEON_BLUE
+StatsLabel.Font = Enum.Font.GothamBold
+StatsLabel.TextSize = 13
+StatsLabel.Parent = StatsOverlay
+
+local statsConn = RunService.Heartbeat:Connect(function(dt)
+    if not statsEnabled then return end
+    local fps = dt > 0 and (1 / dt) or 0
+    local ping = 0
+    pcall(function() ping = math.floor(LocalPlayer:GetNetworkPing() * 1000) end)
+    StatsLabel.Text = string.format("FPS: %d | Ping: %dms", math.floor(fps + 0.5), ping)
+end)
+table.insert(activeConnections, statsConn)
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 360, 0, 200)
+MainFrame.Position = UDim2.new(0.5, -180, 0.5, -100)
+MainFrame.BackgroundColor3 = Color3.fromRGB(12, 14, 20)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Visible = true
+MainFrame.ZIndex = 10
+MainFrame.Parent = ScreenGui
+
+task.defer(function()
+    pcall(function()
+        ScreenGui.Enabled = true
+        MainFrame.Visible = true
+    end)
+end)
+
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0, 10)
+UICorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Name = "NeonOutline"
+MainStroke.Color = NEON_BLUE
+MainStroke.Thickness = 1.5
+MainStroke.Transparency = 0.1
+MainStroke.Parent = MainFrame
+
+-- Title bar
+local TitleBar = Instance.new("Frame")
+TitleBar.Name = "TitleBar"
+TitleBar.Size = UDim2.new(1, 0, 0, 36)
+TitleBar.BackgroundColor3 = Color3.fromRGB(16, 18, 26)
+TitleBar.BorderSizePixel = 0
+TitleBar.Parent = MainFrame
+
+local TitleCorner = Instance.new("UICorner")
+TitleCorner.CornerRadius = UDim.new(0, 10)
+TitleCorner.Parent = TitleBar
+
+local TitleStroke = Instance.new("UIStroke")
+TitleStroke.Name = "NeonOutline"
+TitleStroke.Color = NEON_BLUE
+TitleStroke.Thickness = 1
+TitleStroke.Transparency = 0.2
+TitleStroke.Parent = TitleBar
+
+local TitleCoverFix = Instance.new("Frame")
+TitleCoverFix.Size = UDim2.new(1, 0, 0, 10)
+TitleCoverFix.Position = UDim2.new(0, 0, 1, -10)
+TitleCoverFix.BackgroundColor3 = Color3.fromRGB(16, 18, 26)
+TitleCoverFix.BorderSizePixel = 0
+TitleCoverFix.ZIndex = 0
+TitleCoverFix.Parent = TitleBar
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Name = "TitleLabel"
+TitleLabel.Size = UDim2.new(1, -40, 1, 0)
+TitleLabel.Position = UDim2.new(0, 12, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "REX SCRIPT"
+TitleLabel.TextColor3 = NEON_BLUE
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextSize = 16
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TitleBar
+
+local MiniIconLabel = Instance.new("TextLabel")
+MiniIconLabel.Name = "MiniIconLabel"
+MiniIconLabel.Size = UDim2.new(1, 0, 1, 0)
+MiniIconLabel.BackgroundTransparency = 1
+MiniIconLabel.Text = "REX"
+MiniIconLabel.TextColor3 = NEON_ORANGE
+MiniIconLabel.Font = Enum.Font.GothamBold
+MiniIconLabel.TextSize = 14
+MiniIconLabel.Visible = false
+MiniIconLabel.ZIndex = 5
+MiniIconLabel.Parent = TitleBar
+
+local MinimizeBtn = Instance.new("TextButton")
+MinimizeBtn.Name = "MinimizeBtn"
+MinimizeBtn.Size = UDim2.new(0, 26, 0, 26)
+MinimizeBtn.Position = UDim2.new(1, -31, 0, 5)
+MinimizeBtn.BackgroundColor3 = Color3.fromRGB(24, 28, 38)
+MinimizeBtn.Text = "-"
+MinimizeBtn.TextColor3 = NEON_BLUE
+MinimizeBtn.Font = Enum.Font.GothamBold
+MinimizeBtn.TextSize = 18
+MinimizeBtn.ZIndex = 30
+MinimizeBtn.Parent = TitleBar
+
+local MinBtnCorner = Instance.new("UICorner")
+MinBtnCorner.CornerRadius = UDim.new(0, 7)
+MinBtnCorner.Parent = MinimizeBtn
+
+-- Body (holds a grid of toggle buttons, the sliders, and Kill Menu)
+local Body = Instance.new("Frame")
+Body.Name = "Body"
+Body.Size = UDim2.new(1, 0, 1, -36)
+Body.Position = UDim2.new(0, 0, 0, 36)
+Body.BackgroundTransparency = 1
+Body.ClipsDescendants = false
+Body.Parent = MainFrame
+
+local BodyListLayout = Instance.new("UIListLayout")
+BodyListLayout.Padding = UDim.new(0, 8)
+BodyListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+BodyListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+BodyListLayout.Parent = Body
+
+local BodyPadding = Instance.new("UIPadding")
+BodyPadding.PaddingTop = UDim.new(0, 12)
+BodyPadding.PaddingBottom = UDim.new(0, 12)
+BodyPadding.PaddingLeft = UDim.new(0, 14)
+BodyPadding.PaddingRight = UDim.new(0, 14)
+BodyPadding.Parent = Body
+
+-- ---- Grid container for the toggle buttons ----
+-- Math: Body content width = 360 - 14 - 14 = 332.
+-- 4 columns: cellWidth*4 + cellPadding*3 = 332  ->  cellWidth = 77, padding = 8
+-- (77*4 + 8*3 = 308 + 24 = 332, exact fit, nothing clipped outside).
+local GridContainer = Instance.new("Frame")
+GridContainer.Name = "GridContainer"
+GridContainer.LayoutOrder = 1
+GridContainer.Size = UDim2.new(1, 0, 0, 0)
+GridContainer.AutomaticSize = Enum.AutomaticSize.Y
+GridContainer.BackgroundTransparency = 1
+GridContainer.Parent = Body
+
+local GridLayout = Instance.new("UIGridLayout")
+GridLayout.CellSize = UDim2.new(0, 77, 0, 38)
+GridLayout.CellPadding = UDim2.new(0, 8, 0, 8)
+GridLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+GridLayout.SortOrder = Enum.SortOrder.LayoutOrder
+GridLayout.Parent = GridContainer
+
+-- ---- Sliders container (full-width rows, below the grid) ----
+local SlidersContainer = Instance.new("Frame")
+SlidersContainer.Name = "SlidersContainer"
+SlidersContainer.LayoutOrder = 2
+SlidersContainer.Size = UDim2.new(1, 0, 0, 0)
+SlidersContainer.AutomaticSize = Enum.AutomaticSize.Y
+SlidersContainer.BackgroundTransparency = 1
+SlidersContainer.Parent = Body
+
+local SlidersListLayout = Instance.new("UIListLayout")
+SlidersListLayout.Padding = UDim.new(0, 6)
+SlidersListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+SlidersListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+SlidersListLayout.Parent = SlidersContainer
+
+-- Helper: styled grid button
+local function createButton(name, text, order)
+    local btn = Instance.new("TextButton")
+    btn.Name = name
+    btn.LayoutOrder = order
+    btn.BackgroundColor3 = Color3.fromRGB(20, 23, 32)
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(200, 225, 255)
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 12
+    btn.TextScaled = true
+    btn.TextWrapped = true
+    btn.AutoButtonColor = false
+    btn.Parent = GridContainer
+
+    local sizeConstraint = Instance.new("UITextSizeConstraint")
+    sizeConstraint.MaxTextSize = 12
+    sizeConstraint.MinTextSize = 7
+    sizeConstraint.Parent = btn
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 7)
+    corner.Parent = btn
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Name = "NeonOutline"
+    stroke.Color = NEON_BLUE
+    stroke.Thickness = 1
+    stroke.Transparency = 0.3
+    stroke.Parent = btn
+
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(28, 34, 48)}):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(20, 23, 32)}):Play()
+    end)
+
+    return btn
+end
+
+local function setToggleVisual(btn, on)
+    btn.BackgroundColor3 = on and Color3.fromRGB(0, 110, 60) or Color3.fromRGB(20, 23, 32)
+end
+
+-- Helper: full-width drag slider, parented into SlidersContainer
+local function createSlider(labelPrefix, order, minVal, maxVal, startVal, onChange)
+    local label = Instance.new("TextLabel")
+    label.Name = labelPrefix .. "Label"
+    label.LayoutOrder = order
+    label.Size = UDim2.new(1, 0, 0, 18)
+    label.BackgroundTransparency = 1
+    label.Text = labelPrefix .. ": " .. startVal
+    label.TextColor3 = Color3.fromRGB(200, 225, 255)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Visible = false
+    label.Parent = SlidersContainer
+
+    local track = Instance.new("Frame")
+    track.Name = labelPrefix .. "Track"
+    track.LayoutOrder = order + 1
+    track.Size = UDim2.new(1, 0, 0, 10)
+    track.BackgroundColor3 = Color3.fromRGB(20, 23, 32)
+    track.BorderSizePixel = 0
+    track.Active = true
+    track.Visible = false
+    track.Parent = SlidersContainer
+
+    local trackCorner = Instance.new("UICorner")
+    trackCorner.CornerRadius = UDim.new(1, 0)
+    trackCorner.Parent = track
+
+    local fill = Instance.new("Frame")
+    fill.Name = "Fill"
+    fill.Size = UDim2.new(0, 0, 1, 0)
+    fill.BackgroundColor3 = NEON_BLUE
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+
+    local fillCorner = Instance.new("UICorner")
+    fillCorner.CornerRadius = UDim.new(1, 0)
+    fillCorner.Parent = fill
+
+    local knob = Instance.new("Frame")
+    knob.Name = "Knob"
+    knob.Size = UDim2.new(0, 16, 0, 16)
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.Position = UDim2.new(0, 0, 0.5, 0)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    knob.ZIndex = 2
+    knob.Active = true
+    knob.Parent = track
+
+    local knobCorner = Instance.new("UICorner")
+    knobCorner.CornerRadius = UDim.new(1, 0)
+    knobCorner.Parent = knob
+
+    local dragging = false
+
+    local function setFromX(xPos)
+        local trackAbsPos = track.AbsolutePosition.X
+        local trackAbsSize = track.AbsoluteSize.X
+        local rawAlpha = (xPos - trackAbsPos) / trackAbsSize
+        local alpha = math.clamp(rawAlpha, 0, 1)
+        local value = math.floor(minVal + (maxVal - minVal) * alpha)
+
+        fill.Size = UDim2.new(alpha, 0, 1, 0)
+        knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+        label.Text = labelPrefix .. ": " .. value
+
+        onChange(value)
+    end
+
+    local function beginDrag(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            setFromX(input.Position.X)
+        end
+    end
+
+    track.InputBegan:Connect(beginDrag)
+    knob.InputBegan:Connect(beginDrag)
+
+    local changedConn = UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            setFromX(input.Position.X)
+        end
+    end)
+    table.insert(activeConnections, changedConn)
+
+    local endedConn = UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    table.insert(activeConnections, endedConn)
+
+    task.defer(function()
+        RunService.Heartbeat:Wait()
+        setFromX(track.AbsolutePosition.X + (track.AbsoluteSize.X * ((startVal - minVal) / (maxVal - minVal))))
+    end)
+
+    local api = {}
+    function api.SetVisible(visible)
+        label.Visible = visible
+        track.Visible = visible
+    end
+
+    return api
+end
+
+-- ===================== BUTTONS (grid, 16 total -> 4 cols x 4 rows) =====================
+local FixLagBtn = createButton("FixLagBtn", "Fix Lag", 1)
+local SpeedToggleBtn = createButton("SpeedToggleBtn", "Speed: OFF", 2)
+local SuperJumpBtn = createButton("SuperJumpBtn", "S.Jump: OFF", 3)
+local CrosshairBtn = createButton("CrosshairBtn", "Ngắm: OFF", 4)
+local AutoJumpBtn = createButton("AutoJumpBtn", "Auto Jump: ON", 5)
+local AntiAfkBtn = createButton("AntiAfkBtn", "Anti-AFK: OFF", 6)
+local WideFovBtn = createButton("WideFovBtn", "Wide FOV: OFF", 7)
+local ZoomBtn = createButton("ZoomBtn", "Zoom Xa: OFF", 8)
+local LowRenderBtn = createButton("LowRenderBtn", "Render Thấp: OFF", 9)
+local FullbrightBtn = createButton("FullbrightBtn", "Fullbright: OFF", 10)
+local StatsBtn = createButton("StatsBtn", "Stats: OFF", 11)
+local MuteBtn = createButton("MuteBtn", "Mute: OFF", 12)
+local RespawnBtn = createButton("RespawnBtn", "Respawn", 13)
+local ResetAllBtn = createButton("ResetAllBtn", "Reset All", 14)
+local ExportBtn = createButton("ExportBtn", "Export Cfg", 15)
+local SessionTimerBtn = createButton("SessionTimerBtn", "Giờ Chơi", 16)
+
+setToggleVisual(AutoJumpBtn, autoJumpEnabled)
+
+local speedSlider = createSlider("Speed", 1, MIN_SPEED, MAX_SPEED, currentSpeed, function(value)
+    currentSpeed = value
+end)
+local jumpSlider = createSlider("Jump Power", 3, MIN_JUMP, MAX_JUMP, currentJump, function(value)
+    currentJump = value
+end)
+
+-- Kill Menu: full-width, below everything, kept visually distinct (red)
+local KillMenuBtn = Instance.new("TextButton")
+KillMenuBtn.Name = "KillMenuBtn"
+KillMenuBtn.LayoutOrder = 3
+KillMenuBtn.Size = UDim2.new(1, 0, 0, 36)
+KillMenuBtn.BackgroundColor3 = Color3.fromRGB(70, 20, 25)
+KillMenuBtn.Text = "KILL MENU"
+KillMenuBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+KillMenuBtn.Font = Enum.Font.GothamBold
+KillMenuBtn.TextSize = 14
+KillMenuBtn.AutoButtonColor = false
+KillMenuBtn.Parent = Body
+local killCorner = Instance.new("UICorner")
+killCorner.CornerRadius = UDim.new(0, 7)
+killCorner.Parent = KillMenuBtn
+local killStroke = Instance.new("UIStroke")
+killStroke.Color = Color3.fromRGB(255, 70, 70)
+killStroke.Thickness = 1
+killStroke.Transparency = 0.2
+killStroke.Parent = KillMenuBtn
+KillMenuBtn.MouseEnter:Connect(function()
+    TweenService:Create(KillMenuBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(95, 28, 34)}):Play()
+end)
+KillMenuBtn.MouseLeave:Connect(function()
+    TweenService:Create(KillMenuBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(70, 20, 25)}):Play()
+end)
+
+-- ===================== MINIMIZE STATE =====================
+local minimized = false
+local expandedSize = MainFrame.Size
+local expandedPos = MainFrame.Position
+local MINIMIZED_SIZE = UDim2.new(0, 55, 0, 55)
+
+local function updatePanelHeight()
+    local contentHeight = BodyListLayout.AbsoluteContentSize.Y
+    local totalHeight = 36 + 12 + contentHeight + 12
+    expandedSize = UDim2.new(0, 360, 0, totalHeight)
+    if not minimized then
+        TweenService:Create(MainFrame, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
+            Size = expandedSize
+        }):Play()
+    end
+end
+
+BodyListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updatePanelHeight)
+task.defer(function()
+    RunService.Heartbeat:Wait()
+    updatePanelHeight()
+end)
+
+-- ===================== CORE TOGGLES =====================
+SpeedToggleBtn.MouseButton1Click:Connect(function()
+    speedEnabled = not speedEnabled
+    speedSlider.SetVisible(speedEnabled)
+    SpeedToggleBtn.Text = speedEnabled and "Speed: ON" or "Speed: OFF"
+    setToggleVisual(SpeedToggleBtn, speedEnabled)
+end)
+
+SuperJumpBtn.MouseButton1Click:Connect(function()
+    jumpEnabled = not jumpEnabled
+    jumpSlider.SetVisible(jumpEnabled)
+    SuperJumpBtn.Text = jumpEnabled and "S.Jump: ON" or "S.Jump: OFF"
+    setToggleVisual(SuperJumpBtn, jumpEnabled)
+end)
+
+CrosshairBtn.MouseButton1Click:Connect(function()
+    crosshairEnabled = not crosshairEnabled
+    CrosshairCircle.Visible = crosshairEnabled
+    CrosshairBtn.Text = crosshairEnabled and "Ngắm: ON" or "Ngắm: OFF"
+    setToggleVisual(CrosshairBtn, crosshairEnabled)
+end)
+
+AutoJumpBtn.MouseButton1Click:Connect(function()
+    autoJumpEnabled = not autoJumpEnabled
+    if Humanoid then Humanoid.AutoJumpEnabled = autoJumpEnabled end
+    AutoJumpBtn.Text = autoJumpEnabled and "Auto Jump: ON" or "Auto Jump: OFF"
+    setToggleVisual(AutoJumpBtn, autoJumpEnabled)
+end)
+
+AntiAfkBtn.MouseButton1Click:Connect(function()
+    antiAfkEnabled = not antiAfkEnabled
+    AntiAfkBtn.Text = antiAfkEnabled and "Anti-AFK: ON" or "Anti-AFK: OFF"
+    setToggleVisual(AntiAfkBtn, antiAfkEnabled)
+end)
+
+WideFovBtn.MouseButton1Click:Connect(function()
+    wideFovEnabled = not wideFovEnabled
+    if Camera then
+        Camera.FieldOfView = wideFovEnabled and WIDE_FOV or DEFAULT_FOV
+    end
+    WideFovBtn.Text = wideFovEnabled and "Wide FOV: ON" or "Wide FOV: OFF"
+    setToggleVisual(WideFovBtn, wideFovEnabled)
+end)
+
+ZoomBtn.MouseButton1Click:Connect(function()
+    zoomEnabled = not zoomEnabled
+    pcall(function()
+        LocalPlayer.CameraMaxZoomDistance = zoomEnabled and EXTENDED_ZOOM or DEFAULT_MAX_ZOOM
+    end)
+    ZoomBtn.Text = zoomEnabled and "Zoom Xa: ON" or "Zoom Xa: OFF"
+    setToggleVisual(ZoomBtn, zoomEnabled)
+end)
+
+LowRenderBtn.MouseButton1Click:Connect(function()
+    lowRenderEnabled = not lowRenderEnabled
+    pcall(function()
+        if lowRenderEnabled then
+            workspace.StreamingTargetRadius = 128
+        elseif DEFAULT_STREAM_RADIUS then
+            workspace.StreamingTargetRadius = DEFAULT_STREAM_RADIUS
+        end
+    end)
+    LowRenderBtn.Text = lowRenderEnabled and "Render Thấp: ON" or "Render Thấp: OFF"
+    setToggleVisual(LowRenderBtn, lowRenderEnabled)
+end)
+
+FullbrightBtn.MouseButton1Click:Connect(function()
+    fullbrightEnabled = not fullbrightEnabled
+    if fullbrightEnabled then
+        savedLighting = {
+            Brightness = Lighting.Brightness,
+            ClockTime = Lighting.ClockTime,
+            OutdoorAmbient = Lighting.OutdoorAmbient,
+            Ambient = Lighting.Ambient,
+            GlobalShadows = Lighting.GlobalShadows,
+        }
+        Lighting.Brightness = 3
+        Lighting.ClockTime = 14
+        Lighting.OutdoorAmbient = Color3.fromRGB(200, 200, 200)
+        Lighting.Ambient = Color3.fromRGB(150, 150, 150)
+        Lighting.GlobalShadows = false
+    else
+        if savedLighting.Brightness then
+            Lighting.Brightness = savedLighting.Brightness
+            Lighting.ClockTime = savedLighting.ClockTime
+            Lighting.OutdoorAmbient = savedLighting.OutdoorAmbient
+            Lighting.Ambient = savedLighting.Ambient
+            Lighting.GlobalShadows = savedLighting.GlobalShadows
+        end
+    end
+    FullbrightBtn.Text = fullbrightEnabled and "Fullbright: ON" or "Fullbright: OFF"
+    setToggleVisual(FullbrightBtn, fullbrightEnabled)
+end)
+
+-- ===================== REX EXCLUSIVES =====================
+StatsBtn.MouseButton1Click:Connect(function()
+    statsEnabled = not statsEnabled
+    StatsOverlay.Visible = statsEnabled
+    StatsBtn.Text = statsEnabled and "Stats: ON" or "Stats: OFF"
+    setToggleVisual(StatsBtn, statsEnabled)
+end)
+
+local function setSoundMuted(sound, muted)
+    if muted then
+        if mutedSounds[sound] == nil then mutedSounds[sound] = sound.Volume end
+        sound.Volume = 0
+    elseif mutedSounds[sound] ~= nil then
+        pcall(function() sound.Volume = mutedSounds[sound] end)
+        mutedSounds[sound] = nil
+    end
+end
+
+MuteBtn.MouseButton1Click:Connect(function()
+    muteEnabled = not muteEnabled
+    if muteEnabled then
+        for _, obj in ipairs(game:GetDescendants()) do
+            if obj:IsA("Sound") then setSoundMuted(obj, true) end
+        end
+        muteWatchConn = game.DescendantAdded:Connect(function(obj)
+            if muteEnabled and obj:IsA("Sound") then setSoundMuted(obj, true) end
+        end)
+        table.insert(activeConnections, muteWatchConn)
+    else
+        for sound in pairs(mutedSounds) do setSoundMuted(sound, false) end
+        mutedSounds = {}
+        if muteWatchConn then muteWatchConn:Disconnect(); muteWatchConn = nil end
+    end
+    MuteBtn.Text = muteEnabled and "Mute: ON" or "Mute: OFF"
+    setToggleVisual(MuteBtn, muteEnabled)
+end)
+
+RespawnBtn.MouseButton1Click:Connect(function()
+    pcall(function() LocalPlayer:LoadCharacter() end)
+    RespawnBtn.Text = "Đã hồi sinh"
+    task.delay(1, function()
+        if RespawnBtn and RespawnBtn.Parent then RespawnBtn.Text = "Respawn" end
+    end)
+end)
+
+SessionTimerBtn.MouseButton1Click:Connect(function()
+    sessionTimerEnabled = not sessionTimerEnabled
+    setToggleVisual(SessionTimerBtn, sessionTimerEnabled)
+    if sessionTimerEnabled then
+        task.spawn(function()
+            while sessionTimerEnabled do
+                local elapsed = os.clock() - scriptStartTime
+                local m = math.floor(elapsed / 60)
+                local s = math.floor(elapsed % 60)
+                if SessionTimerBtn and SessionTimerBtn.Parent then
+                    SessionTimerBtn.Text = string.format("%02d:%02d", m, s)
+                end
+                task.wait(1)
+            end
+            if SessionTimerBtn and SessionTimerBtn.Parent then
+                SessionTimerBtn.Text = "Giờ Chơi"
+            end
+        end)
+    end
+end)
+
+local function exportConfig()
+    local cfg = string.format(
+        "REX|speed=%d|jump=%d|wideFov=%s|zoom=%s|lowRender=%s|fullbright=%s|autoJump=%s|antiAfk=%s|mute=%s",
+        currentSpeed, currentJump,
+        tostring(wideFovEnabled), tostring(zoomEnabled), tostring(lowRenderEnabled),
+        tostring(fullbrightEnabled), tostring(autoJumpEnabled), tostring(antiAfkEnabled), tostring(muteEnabled)
+    )
+    local ok = pcall(function()
+        if type(setclipboard) == "function" then
+            setclipboard(cfg)
+        else
+            error("setclipboard not supported")
+        end
+    end)
+    ExportBtn.Text = ok and "Đã copy!" or "Ko hỗ trợ"
+    print("[Rex] Config: " .. cfg)
+    task.delay(1.2, function()
+        if ExportBtn and ExportBtn.Parent then ExportBtn.Text = "Export Cfg" end
+    end)
+end
+ExportBtn.MouseButton1Click:Connect(exportConfig)
+
+-- ===================== RESET ALL (turns every toggle off, keeps the menu open) =====================
+local function resetAll()
+    if speedEnabled then
+        speedEnabled = false
+        speedSlider.SetVisible(false)
+        SpeedToggleBtn.Text = "Speed: OFF"
+        setToggleVisual(SpeedToggleBtn, false)
+    end
+    if jumpEnabled then
+        jumpEnabled = false
+        jumpSlider.SetVisible(false)
+        SuperJumpBtn.Text = "S.Jump: OFF"
+        setToggleVisual(SuperJumpBtn, false)
+    end
+    if crosshairEnabled then
+        crosshairEnabled = false
+        CrosshairCircle.Visible = false
+        CrosshairBtn.Text = "Ngắm: OFF"
+        setToggleVisual(CrosshairBtn, false)
+    end
+    if antiAfkEnabled then
+        antiAfkEnabled = false
+        AntiAfkBtn.Text = "Anti-AFK: OFF"
+        setToggleVisual(AntiAfkBtn, false)
+    end
+    if wideFovEnabled then
+        wideFovEnabled = false
+        if Camera then Camera.FieldOfView = DEFAULT_FOV end
+        WideFovBtn.Text = "Wide FOV: OFF"
+        setToggleVisual(WideFovBtn, false)
+    end
+    if zoomEnabled then
+        zoomEnabled = false
+        pcall(function() LocalPlayer.CameraMaxZoomDistance = DEFAULT_MAX_ZOOM end)
+        ZoomBtn.Text = "Zoom Xa: OFF"
+        setToggleVisual(ZoomBtn, false)
+    end
+    if lowRenderEnabled then
+        lowRenderEnabled = false
+        pcall(function()
+            if DEFAULT_STREAM_RADIUS then workspace.StreamingTargetRadius = DEFAULT_STREAM_RADIUS end
+        end)
+        LowRenderBtn.Text = "Render Thấp: OFF"
+        setToggleVisual(LowRenderBtn, false)
+    end
+    if fullbrightEnabled then
+        fullbrightEnabled = false
+        if savedLighting.Brightness then
+            Lighting.Brightness = savedLighting.Brightness
+            Lighting.ClockTime = savedLighting.ClockTime
+            Lighting.OutdoorAmbient = savedLighting.OutdoorAmbient
+            Lighting.Ambient = savedLighting.Ambient
+            Lighting.GlobalShadows = savedLighting.GlobalShadows
+        end
+        FullbrightBtn.Text = "Fullbright: OFF"
+        setToggleVisual(FullbrightBtn, false)
+    end
+    if statsEnabled then
+        statsEnabled = false
+        StatsOverlay.Visible = false
+        StatsBtn.Text = "Stats: OFF"
+        setToggleVisual(StatsBtn, false)
+    end
+    if muteEnabled then
+        muteEnabled = false
+        for sound in pairs(mutedSounds) do setSoundMuted(sound, false) end
+        mutedSounds = {}
+        if muteWatchConn then muteWatchConn:Disconnect(); muteWatchConn = nil end
+        MuteBtn.Text = "Mute: OFF"
+        setToggleVisual(MuteBtn, false)
+    end
+    sessionTimerEnabled = false -- its own loop notices and resets its label within 1s
+    setToggleVisual(SessionTimerBtn, false)
+
+    print("[Rex] Reset All: every toggle cleared.")
+end
+ResetAllBtn.MouseButton1Click:Connect(resetAll)
+
+-- ===================== FIX LAG (ultra, one-shot) =====================
+local function stripEffectsFrom(root)
+    local removed = 0
+    for _, obj in ipairs(root:GetDescendants()) do
+        if EFFECT_CLASSES[obj.ClassName] then
+            obj:Destroy()
+            removed += 1
+        elseif obj:IsA("BasePart") then
+            obj.CastShadow = false
+        elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
+            obj.Shadows = false
+            obj.Range = 0
+        end
+    end
+    return removed
+end
+
+local function applyLightingWipe()
+    for _, obj in ipairs(Lighting:GetChildren()) do
+        if obj:IsA("BlurEffect") or obj:IsA("ColorCorrectionEffect")
+            or obj:IsA("SunRaysEffect") or obj:IsA("DepthOfFieldEffect")
+            or obj:IsA("BloomEffect") then
+            obj:Destroy()
+        elseif obj:IsA("Atmosphere") or obj:IsA("Clouds") then
+            obj:Destroy()
+        end
+    end
+
+    Lighting.GlobalShadows = false
+    Lighting.FogEnd = 100000
+    pcall(function() Lighting.Technology = Enum.Technology.Compatibility end)
+
+    pcall(function()
+        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+        settings().Rendering.EnableFRM = false
+    end)
+
+    local Terrain = workspace:FindFirstChildOfClass("Terrain")
+    if Terrain then
+        Terrain.WaterWaveSize = 0
+        Terrain.WaterWaveSpeed = 0
+        Terrain.WaterReflectance = 0
+        Terrain.WaterTransparency = 0.5
+        Terrain.Decoration = false
+    end
+end
+
+local function fixLag()
+    local removed = stripEffectsFrom(workspace)
+    applyLightingWipe()
+
+    if not fixLagOn then
+        fixLagOn = true
+        autoCleanConn = workspace.DescendantAdded:Connect(function(obj)
+            if EFFECT_CLASSES[obj.ClassName] then
+                obj:Destroy()
+            elseif obj:IsA("BasePart") then
+                obj.CastShadow = false
+            elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
+                obj.Shadows = false
+                obj.Range = 0
+            end
+        end)
+        table.insert(activeConnections, autoCleanConn)
+    end
+
+    FixLagBtn.Text = "Đã dọn!"
+    task.delay(1, function()
+        if FixLagBtn and FixLagBtn.Parent then
+            FixLagBtn.Text = "Fix Lag"
+        end
+    end)
+    print("[Rex] Fix Lag applied. Removed " .. removed .. " effect instance(s); auto-clean active.")
+end
+
+FixLagBtn.MouseButton1Click:Connect(fixLag)
+
+-- ===================== MINIMIZE (small draggable square) + neon re-theme =====================
+local function toggleMinimize()
+    minimized = not minimized
+    if minimized then
+        expandedPos = MainFrame.Position
+        Body.Visible = false
+        TitleLabel.Visible = false
+        MinimizeBtn.Visible = false
+        MiniIconLabel.Visible = true
+
+        MainStroke.Color = NEON_ORANGE
+        TitleStroke.Color = NEON_ORANGE
+
+        TweenService:Create(MainFrame, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {
+            Size = MINIMIZED_SIZE
+        }):Play()
+        TweenService:Create(TitleBar, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {
+            Size = UDim2.new(1, 0, 1, 0)
+        }):Play()
+    else
+        Body.Visible = true
+        TitleLabel.Visible = true
+        MinimizeBtn.Visible = true
+        MiniIconLabel.Visible = false
+
+        MainStroke.Color = NEON_BLUE
+        TitleStroke.Color = NEON_BLUE
+
+        TweenService:Create(MainFrame, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {
+            Size = expandedSize
+        }):Play()
+        TweenService:Create(TitleBar, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {
+            Size = UDim2.new(1, 0, 0, 36)
+        }):Play()
+    end
+end
+
+MinimizeBtn.MouseButton1Click:Connect(toggleMinimize)
+
+-- ===================== CUSTOM DRAG (UIScale-aware) =====================
+local dragging = false
+local dragStartInputPos = nil
+local frameStartPos = nil
+local totalMoved = 0
+local DRAG_THRESHOLD = 6
+
+local function updateDragPosition(inputPos)
+    local delta = inputPos - dragStartInputPos
+    local scale = MenuScale.Scale
+    if scale <= 0 then scale = 1 end
+    MainFrame.Position = UDim2.new(
+        frameStartPos.X.Scale, frameStartPos.X.Offset + delta.X / scale,
+        frameStartPos.Y.Scale, frameStartPos.Y.Offset + delta.Y / scale
+    )
+    totalMoved = delta.Magnitude
+end
+
+TitleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStartInputPos = Vector2.new(input.Position.X, input.Position.Y)
+        frameStartPos = MainFrame.Position
+        totalMoved = 0
+    end
+end)
+
+local dragChangedConn = UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        updateDragPosition(Vector2.new(input.Position.X, input.Position.Y))
+    end
+end)
+table.insert(activeConnections, dragChangedConn)
+
+local dragEndedConn = UserInputService.InputEnded:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+        and input.UserInputType ~= Enum.UserInputType.Touch then
+        return
+    end
+    dragging = false
+    if minimized and totalMoved < DRAG_THRESHOLD then
+        toggleMinimize()
+    end
+end)
+table.insert(activeConnections, dragEndedConn)
+
+-- ===================== KILL MENU =====================
+local function killMenu()
+    RunService:UnbindFromRenderStep("REX_SpeedJumpEnforce")
+    for _, conn in ipairs(activeConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+
+    if Humanoid and Humanoid.Parent then
+        Humanoid.WalkSpeed = 16
+        Humanoid.JumpPower = 50
+        Humanoid.JumpHeight = 7.2
+        Humanoid.AutoJumpEnabled = true
+    end
+    if Camera then Camera.FieldOfView = DEFAULT_FOV end
+    pcall(function() LocalPlayer.CameraMaxZoomDistance = DEFAULT_MAX_ZOOM end)
+    pcall(function()
+        if DEFAULT_STREAM_RADIUS then workspace.StreamingTargetRadius = DEFAULT_STREAM_RADIUS end
+    end)
+    if fullbrightEnabled and savedLighting.Brightness then
+        Lighting.Brightness = savedLighting.Brightness
+        Lighting.ClockTime = savedLighting.ClockTime
+        Lighting.OutdoorAmbient = savedLighting.OutdoorAmbient
+        Lighting.Ambient = savedLighting.Ambient
+        Lighting.GlobalShadows = savedLighting.GlobalShadows
+    end
+    if muteEnabled then
+        for sound in pairs(mutedSounds) do
+            pcall(function() if sound and sound.Parent then sound.Volume = mutedSounds[sound] end end)
+        end
+    end
+
+    print("[Rex] Menu closed, all features disabled.")
+    ScreenGui:Destroy()
+end
+
+KillMenuBtn.MouseButton1Click:Connect(killMenu)
+
+print("[Rex] Rex Script loaded. 16 tools ready.")
